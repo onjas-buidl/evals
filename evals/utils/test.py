@@ -1,8 +1,13 @@
 from typing import Union
+
 from evals.api import CompletionFn, CompletionResult
 from evals.prompt.base import OpenAICreateChatPrompt, OpenAICreatePrompt, Prompt
 
+
 class TestCompletionResult(CompletionResult):
+
+    __test__ = False  # Prevent pytest from trying to run this class as a test
+
     def __init__(self, completion: str):
         self.completion = completion
 
@@ -11,6 +16,9 @@ class TestCompletionResult(CompletionResult):
 
 
 class TestCompletionFn(CompletionFn):
+
+    __test__ = False  # Prevent pytest from trying to run this class as a test
+
     def __init__(self, completion: str):
         self.completion = completion
 

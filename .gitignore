@@ -10,3 +10,12 @@ venv/
 
 # PyCharm folder metadata
 .idea/
+
+build
+
+openai-key.txt
+*.code-workspace
+
+# Ignore run_experiments.sh results
+evals/elsuite/**/logs/
+evals/elsuite/**/outputs/

@@ -3,7 +3,6 @@ Functions to handle registration of evals. To add a new eval to the registry,
 add an entry in one of the YAML files in the `../registry` dir.
 By convention, every eval name should start with {base_eval}.{split}.
 """
-
 import copy
 import difflib
 import functools
@@ -12,9 +11,12 @@ import os
 import re
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Iterator, Optional, Sequence, Type, TypeVar, Union
+from typing import Any, Generator, Iterator, Optional, Sequence, Tuple, Type, TypeVar, Union
 
 import openai
+from openai import OpenAI
+
+client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 import yaml
 
 from evals import OpenAIChatCompletionFn, OpenAICompletionFn
@@ -25,13 +27,18 @@ from evals.utils.misc import make_object
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_PATHS = [Path(__file__).parents[0].resolve() / "registry", Path.home() / ".evals"]
+DEFAULT_PATHS = [
+    Path(__file__).parents[0].resolve() / "registry",
+    Path.home() / ".evals",
+]
+SPEC_RESERVED_KEYWORDS = ["key", "group", "cls"]
 
 
 def n_ctx_from_model_name(model_name: str) -> Optional[int]:
-    """Returns n_ctx for a given API model name. Model list last updated 2023-06-16."""
+    """Returns n_ctx for a given API model name. Model list last updated 2023-10-24."""
     # note that for most models, the max tokens is n_ctx + 1
     PREFIX_AND_N_CTX: list[tuple[str, int]] = [
+        ("gpt-3.5-turbo-16k-", 16384),
         ("gpt-3.5-turbo-", 4096),
         ("gpt-4-32k-", 32768),
         ("gpt-4-", 8192),
@@ -49,6 +56,7 @@ def n_ctx_from_model_name(model_name: str) -> Optional[int]:
         "text-davinci-002": 4096,
         "text-davinci-003": 4096,
         "gpt-3.5-turbo": 4096,
+        "gpt-3.5-turbo-16k": 16384,
         "gpt-4": 8192,
         "gpt-4-32k": 32768,
         "gpt-4-base": 8192,
@@ -71,13 +79,15 @@ def is_chat_model(model_name: str) -> bool:
     if model_name in {"gpt-4-base"}:
         return False
 
-    CHAT_MODEL_NAMES = {"gpt-3.5-turbo", "gpt-4", "gpt-4-32k"}
+    CHAT_MODEL_NAMES = {"gpt-3.5-turbo", "gpt-3.5-turbo-16k", "gpt-4", "gpt-4-32k"}
+
     if model_name in CHAT_MODEL_NAMES:
         return True
 
-    for model_prefix in {"gpt-3.5-turbo-", "gpt-4-", "gpt-4-32k-"}:
+    for model_prefix in {"gpt-3.5-turbo-", "gpt-4-"}:
         if model_name.startswith(model_prefix):
             return True
+
     return False
 
 
@@ -89,35 +99,38 @@ class Registry:
     def __init__(self, registry_paths: Sequence[Union[str, Path]] = DEFAULT_PATHS):
         self._registry_paths = [Path(p) if isinstance(p, str) else p for p in registry_paths]
 
-    def add_registry_paths(self, paths: list[Union[str, Path]]) -> None:
+    def add_registry_paths(self, paths: Sequence[Union[str, Path]]) -> None:
         self._registry_paths.extend([Path(p) if isinstance(p, str) else p for p in paths])
 
     @cached_property
     def api_model_ids(self) -> list[str]:
         try:
-            return [m["id"] for m in openai.Model.list()["data"]]
-        except openai.error.OpenAIError as err:  # type: ignore
+            return [m.id for m in client.models.list().data]
+        except openai.OpenAIError as err:  # type: ignore
             # Errors can happen when running eval with completion function that uses custom
             # API endpoints and authentication mechanisms.
             logger.warning(f"Could not fetch API model IDs from OpenAI API: {err}")
             return []
 
-    def make_completion_fn(self, name: str) -> CompletionFn:
+    def make_completion_fn(
+        self,
+        name: str,
+        **kwargs: Any,
+    ) -> CompletionFn:
         """
         Create a CompletionFn. The name can be one of the following formats:
         1. openai-model-id (e.g. "gpt-3.5-turbo")
         2. completion-fn-id (from the registry)
         """
-
         if name == "dummy":
             return DummyCompletionFn()
 
         n_ctx = n_ctx_from_model_name(name)
 
         if is_chat_model(name):
-            return OpenAIChatCompletionFn(model=name, n_ctx=n_ctx)
+            return OpenAIChatCompletionFn(model=name, n_ctx=n_ctx, **kwargs)
         elif name in self.api_model_ids:
-            return OpenAICompletionFn(model=name, n_ctx=n_ctx)
+            return OpenAICompletionFn(model=name, n_ctx=n_ctx, **kwargs)
 
         # No match, so try to find a completion-fn-id in the registry
         spec = self.get_completion_fn(name)
@@ -125,6 +138,7 @@ class Registry:
             raise ValueError(f"Could not find CompletionFn in the registry with ID {name}")
         if spec.args is None:
             spec.args = {}
+        spec.args.update(kwargs)
 
         spec.args["registry"] = self
         instance = make_object(spec.cls)(**spec.args or {})
@@ -137,7 +151,7 @@ class Registry:
     def _dereference(
         self, name: str, d: RawRegistry, object: str, type: Type[T], **kwargs: dict
     ) -> Optional[T]:
-        if not name in d:
+        if name not in d:
             logger.warning(
                 (
                     f"{object} '{name}' not found. "
@@ -210,7 +224,7 @@ class Registry:
         return base_evals
 
     def get_base_eval(self, name: str) -> Optional[BaseEvalSpec]:
-        if not name in self._evals:
+        if name not in self._evals:
             return None
 
         spec_or_alias = self._evals[name]
@@ -224,7 +238,7 @@ class Registry:
         alias = spec_or_alias
         return BaseEvalSpec(id=alias)
 
-    def _process_file(self, registry: RawRegistry, path: Path) -> None:
+    def _load_file(self, path: Path) -> Generator[Tuple[str, Path, dict], None, None]:
         with open(path, "r", encoding="utf-8") as f:
             d = yaml.safe_load(f)
 
@@ -233,63 +247,73 @@ class Registry:
             return
 
         for name, spec in d.items():
-            assert name not in registry, f"duplicate entry: {name} from {path}"
-            if isinstance(spec, dict):
-                if "key" in spec:
-                    raise ValueError(
-                        f"key is a reserved keyword, but was used in {name} from {path}"
-                    )
-                if "group" in spec:
-                    raise ValueError(
-                        f"group is a reserved keyword, but was used in {name} from {path}"
-                    )
-                if "cls" in spec:
-                    raise ValueError(
-                        f"cls is a reserved keyword, but was used in {name} from {path}"
-                    )
+            yield name, path, spec
+
+    def _load_directory(self, path: Path) -> Generator[Tuple[str, Path, dict], None, None]:
+        files = Path(path).glob("*.yaml")
+        for file in files:
+            yield from self._load_file(file)
+
+    def _load_resources(
+        self, registry_path: Path, resource_type: str
+    ) -> Generator[Tuple[str, Path, dict], None, None]:
+        path = registry_path / resource_type
+        logging.info(f"Loading registry from {path}")
+
+        if os.path.exists(path):
+            if os.path.isdir(path):
+                yield from self._load_directory(path)
+            else:
+                yield from self._load_file(path)
+
+    @staticmethod
+    def _validate_reserved_keywords(spec: dict, name: str, path: Path) -> None:
+        for reserved_keyword in SPEC_RESERVED_KEYWORDS:
+            if reserved_keyword in spec:
+                raise ValueError(
+                    f"{reserved_keyword} is a reserved keyword, but was used in {name} from {path}"
+                )
+
+    def _load_registry(self, registry_paths: Sequence[Path], resource_type: str) -> RawRegistry:
+        """Load registry from a list of regstry paths and a specific resource type
+
+        Each path includes yaml files which are a dictionary of name -> spec.
+        """
+
+        registry: RawRegistry = {}
+
+        for registry_path in registry_paths:
+            for name, path, spec in self._load_resources(registry_path, resource_type):
+                assert name not in registry, f"duplicate entry: {name} from {path}"
+                self._validate_reserved_keywords(spec, name, path)
 
                 spec["key"] = name
                 spec["group"] = str(os.path.basename(path).split(".")[0])
+                spec["registry_path"] = registry_path
+
                 if "class" in spec:
                     spec["cls"] = spec["class"]
                     del spec["class"]
-            registry[name] = spec
 
-    def _process_directory(self, registry: RawRegistry, path: Path) -> None:
-        files = Path(path).glob("*.yaml")
-        for file in files:
-            self._process_file(registry, file)
+                registry[name] = spec
 
-    def _load_registry(self, paths: Sequence[Path]) -> RawRegistry:
-        """Load registry from a list of paths.
-
-        Each path or yaml specifies a dictionary of name -> spec.
-        """
-        registry: RawRegistry = {}
-        for path in paths:
-            logging.info(f"Loading registry from {path}")
-            if os.path.exists(path):
-                if os.path.isdir(path):
-                    self._process_directory(registry, path)
-                else:
-                    self._process_file(registry, path)
         return registry
 
     @functools.cached_property
     def _completion_fns(self) -> RawRegistry:
-        return self._load_registry([p / "completion_fns" for p in self._registry_paths])
+        return self._load_registry(self._registry_paths, "completion_fns")
 
     @functools.cached_property
     def _eval_sets(self) -> RawRegistry:
-        return self._load_registry([p / "eval_sets" for p in self._registry_paths])
+        return self._load_registry(self._registry_paths, "eval_sets")
 
     @functools.cached_property
     def _evals(self) -> RawRegistry:
-        return self._load_registry([p / "evals" for p in self._registry_paths])
+        return self._load_registry(self._registry_paths, "evals")
 
     @functools.cached_property
     def _modelgraded_specs(self) -> RawRegistry:
-        return self._load_registry([p / "modelgraded" for p in self._registry_paths])
+        return self._load_registry(self._registry_paths, "modelgraded")
 
 
 registry = Registry()
